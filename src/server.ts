@@ -1,6 +1,14 @@
 import * as WebSocket from 'ws';
 import { WebSocketServer } from 'ws';
 import { parse } from 'url';
+import { RateLimiterMemory } from 'rate-limiter-flexible';
+
+const opts = {
+  points: 20,
+  duration: 1, // Per second
+};
+
+const rateLimiter = new RateLimiterMemory(opts);
 
 // FIXME: should it even log stuff?
 const log = (x) => {
@@ -13,7 +21,13 @@ const log = (x) => {
    and complex logic like figuring out on client side
    whether event.code may result in reconnect or not,
    storing messages and sending them in right order etc. */
-const wss = new WebSocketServer({ port: 8080 }, { reconnect: false });
+const wss = new WebSocketServer(
+  {
+    port: 8080,
+    maxPayload: 65535 * 3, // FIXME: [2024-02-24 01:33] this is just a guess
+  },
+  // { reconnect: false }, // FIXME: [2024-02-24 01:33] I think this is not needed since ws doesn't reconnect automatically
+);
 
 const answerer = 'answerer';
 const offerer = 'offerer';
@@ -67,8 +81,11 @@ wss.on('connection', (ws, request) => {
   const role = params.get('role');
   const id = params.get('id');
 
+  const roleInStorage = storageOfPairs?.[id]?.[role];
+
   if (
     id &&
+    !roleInStorage &&
     (role === offerer ||
       // if answerer connected after offerer
       (role === answerer && storageOfPairs[id]?.[offerer]))
@@ -97,55 +114,60 @@ wss.on('connection', (ws, request) => {
 
     // onclose is run even if u call terminate
     ws.on('close', () => {
-      cleanUp(id);
       log(`disconnecting id ${id}`);
+      cleanUp(id);
     });
 
     ws.on('message', (data, isBinary) => {
-      try {
-        /* FIXME: TS: i have no idea how to deal with this,
-                   RawData is what is written in api of ws:
-                   it is Buffer (which has to json function which calls JSON.stringify anyway)
-                   or ArrayBuffer or Buffer[] */
-        const d: Msg = JSON.parse(`${data}`) || {};
-        log(`recieved message from ${role} ${id} ${JSON.stringify(d)}`);
+      rateLimiter
+        .consume(`${id}${role}`)
+        .then(() => {
+          /* FIXME: TS: i have no idea how to deal with this,
+                 RawData is what is written in api of ws:
+                 it is Buffer (which has to json function which calls JSON.stringify anyway)
+                 or ArrayBuffer or Buffer[] */
+          const d: Msg = JSON.parse(`${data}`) || {};
+          log(`recieved message from ${role} ${id} ${JSON.stringify(d)}`);
 
-        const opponentWs = storageOfPairs[id][invertRole(role)];
+          const opponentWs = storageOfPairs[id][invertRole(role)];
 
-        if (opponentWs) {
-          switch (d.type) {
-            case 'offer': {
-              log(`recieved offer, redirecting to opponent ${id}`);
-              sendMsg(opponentWs, d);
+          if (opponentWs) {
+            switch (d.type) {
+              case 'offer': {
+                log(`recieved offer, redirecting to opponent ${id}`);
+                sendMsg(opponentWs, d);
 
-              break;
-            }
-            case 'answer': {
-              log(`recieved answer, redirecting to opponent ${id}`);
-              sendMsg(opponentWs, d);
+                break;
+              }
+              case 'answer': {
+                log(`recieved answer, redirecting to opponent ${id}`);
+                sendMsg(opponentWs, d);
 
-              break;
-            }
-            case 'candidate': {
-              log(`recieved ice, redirecting to opponent ${id}`);
-              sendMsg(opponentWs, d);
+                break;
+              }
+              case 'candidate': {
+                log(`recieved ice, redirecting to opponent ${id}`);
+                sendMsg(opponentWs, d);
 
-              break;
-            }
+                break;
+              }
 
-            default: {
-              console.error(
-                `recieved unknown type of message: ${d.type}, ${d}`,
-              );
+              default: {
+                console.error(
+                  `recieved unknown type of message: ${d.type}, ${d}`,
+                );
 
-              break;
+                break;
+              }
             }
           }
-        }
-      } catch (err) {
-        // FIXME: should connection close or what happens?
-        console.error('wasnt json', err);
-      }
+        })
+        .catch((err) => {
+          // FIXME: should connection close or what happens?
+          console.error('wasnt json', err);
+          ws.terminate();
+          rateLimiter.delete(`${id}${role}`);
+        });
     });
   } else {
     ws.terminate();

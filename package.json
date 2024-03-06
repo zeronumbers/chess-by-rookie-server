@@ -33,6 +33,7 @@
   },
   "dependencies": {
     "@types/ws": "^8.5.10",
+    "rate-limiter-flexible": "^5.0.0",
     "ws": "^8.16.0"
   }
 }
